@@ -31,7 +31,7 @@ from Cocoa import \
     NSRunLoop, \
     NSWorkspace, \
     kCFRunLoopCommonModes
-    
+
 from SystemConfiguration import \
     SCDynamicStoreCopyKeyList, \
     SCDynamicStoreCreate, \
@@ -47,12 +47,13 @@ from FSEvents import \
     kFSEventStreamEventFlagMustScanSubDirs, \
     kFSEventStreamEventFlagUserDropped, \
     kFSEventStreamEventFlagKernelDropped
-    
+
 import os
 import os.path
 import logging
 import logging.handlers
 import sys
+import re
 from subprocess import call
 from optparse import OptionParser
 from plistlib import readPlist, writePlist
@@ -63,7 +64,7 @@ from datetime import datetime
 
 __all__          = ['BaseHandler', 'do_shell']
 
-VERSION          = '$Revision: 24$'
+VERSION          = '$Revision:$'
 
 HANDLER_OBJECTS  = dict()     # Events which have a "class" handler use an instantiated object; we want to load only one copy
 SC_HANDLERS      = dict()     # Callbacks indexed by SystemConfiguration keys
@@ -72,11 +73,38 @@ FS_WATCHED_FILES = dict()     # Callbacks indexed by filesystem path
 CRANKD_OPTIONS   = None
 CRANKD_CONFIG    = None
 
+
 class BaseHandler(object):
     """A base class from which event handlers can inherit things like the system logger"""
     options = {}
     logger  = logging.getLogger()
 
+def log_list(msg, items, level=logging.INFO):
+    """
+    Record a a list of values with a message
+
+    This would ordinarily be a simple logging call but we want to keep the
+    length below the 1024-byte syslog() limitation and we'll format things
+    nicely by repeating our message with as many of the values as will fit.
+
+    Individual items longer than the maximum length will be truncated.
+    """
+
+    max_len    = 1024 - len(msg % "")
+    cur_len    = 0
+    cur_items  = list()
+
+    while [ i[:max_len] for i in items]:
+        i = items.pop()
+        if cur_len + len(i) + 2 > max_len:
+            logging.info(msg % ", ".join(cur_items))
+            cur_len = 0
+            cur_items = list()
+
+        cur_items.append(i)
+        cur_len += len(i) + 2
+
+    logging.log(level, msg % ", ".join(cur_items))
 
 def get_callable_for_event(name, event_config, context=None):
     """
@@ -138,7 +166,6 @@ def get_callable_from_string(f_name):
 
 def get_handler_object(class_name):
     """Return a single instance of the given class name, instantiating it if necessary"""
-    # BUG? global HANDLER_OBJECTS
 
     if class_name not in HANDLER_OBJECTS:
         h_obj = get_callable_from_string(class_name)()
@@ -152,6 +179,7 @@ def get_handler_object(class_name):
 
 def handle_sc_event(store, changed_keys, info):
     """Fire every event handler for one or more events"""
+
     for key in changed_keys:
         SC_HANDLERS[key](key=key, info=info)
 
@@ -201,13 +229,26 @@ def process_commandline():
 
     parser.add_option("-f", "--config", dest="config_file", help='Use an alternate config file instead of %default', default=preference_file)
     parser.add_option("-l", "--list-events", action="callback", callback=list_events, help="List the events which can be monitored")
+    parser.add_option("-d", "--debug", action="count", default=False, help="Log detailed progress information")
     (options, args) = parser.parse_args()
 
     if len(args):
-        print >> sys.stderr, "Unknown command-line arguments:", args
-        sys.exit(1)
+        parser.error("Unknown command-line arguments: %s" % args)
 
     options.support_path = support_path
+    options.config_file = os.path.realpath(options.config_file)
+
+    # This is somewhat messy but we want to alter the command-line to use full
+    # file paths in case someone's code changes the current directory or the
+    sys.argv = [ os.path.realpath(sys.argv[0]), ]
+
+    if options.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        sys.argv.append("--debug")
+
+    if options.config_file:
+        sys.argv.append("--config")
+        sys.argv.append(options.config_file)
 
     return options
 
@@ -215,8 +256,9 @@ def process_commandline():
 def load_config(options):
     """Load our configuration from plist or create a default file if none exists"""
     if not os.path.exists(options.config_file):
-        print 'Creating %s with default options for you to customize' % options.config_file
-        print '%s --list-events will list the events you can monitor on this system' % sys.argv[0]
+        logging.info("%s does not exist - initializing with an example configuration" % CRANKD_OPTIONS.config_file)
+        print >>sys.stderr, 'Creating %s with default options for you to customize' % options.config_file
+        print >>sys.stderr, '%s --list-events will list the events you can monitor on this system' % sys.argv[0]
         example_config = {
             'SystemConfiguration': {
                 'State:/Network/Global/IPv4': {
@@ -238,6 +280,8 @@ def load_config(options):
         writePlist(example_config, options.config_file)
         sys.exit(1)
 
+    logging.info("Loading configuration from %s" % CRANKD_OPTIONS.config_file)
+
     plist = readPlist(options.config_file)
 
     if "imports" in plist:
@@ -252,18 +296,14 @@ def load_config(options):
 
 def configure_logging():
     """Configures the logging module"""
-
-    # TODO: Make the log level configurable in our config file
-    default_level = logging.DEBUG if sys.stdin.isatty() else logging.INFO
-
-    logging.basicConfig(level=default_level, format='%(levelname)s: %(message)s')
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
     # Enable logging to syslog as well:
     # Normally this would not be necessary but logging assumes syslog listens on
     # localhost syslog/udp, which is disabled on 10.5 (rdar://5871746)
     syslog = logging.handlers.SysLogHandler('/var/run/syslog')
     syslog.setFormatter(logging.Formatter('%(name)s: %(message)s'))
-    syslog.setLevel(logging.DEBUG)
+    syslog.setLevel(logging.INFO)
     logging.getLogger().addHandler(syslog)
 
 
@@ -312,7 +352,7 @@ def add_workspace_notifications(nsw_config):
 
             notification_center.addObserver_selector_name_object_(handler, "onNotification:", event, None)
 
-    logging.info("Listening for these NSWorkspace notifications: %s" % ', '.join(nsw_config.keys()))
+    log_list("Listening for these NSWorkspace notifications: %s", nsw_config.keys())
 
 
 def add_sc_notifications(sc_config):
@@ -347,7 +387,7 @@ def add_sc_notifications(sc_config):
         kCFRunLoopCommonModes
     )
 
-    logging.info("Listening for these SystemConfiguration events: %s" % ', '.join(keys))
+    log_list("Listening for these SystemConfiguration events: %s", keys)
 
 
 def add_fs_notifications(fs_config):
@@ -380,7 +420,7 @@ def start_fs_events():
         1.0,                                # Process events within 1 second
         0                                   # We don't need any special flags for our stream
     )
-    
+
     if not stream_ref:
         raise RuntimeError("FSEventStreamCreate() failed!")
 
@@ -422,15 +462,11 @@ def timer_callback(*args):
 
 
 def main():
+    configure_logging()
+
+    global CRANKD_OPTIONS, CRANKD_CONFIG
     CRANKD_OPTIONS = process_commandline()
     CRANKD_CONFIG  = load_config(CRANKD_OPTIONS)
-
-    # We replace the initial program name with one which won't break if relative paths are used:    
-    sys.argv[0]    = os.path.realpath(sys.argv[0])
-
-    configure_logging()
-    
-    logging.info("Loaded configuration from %s" % CRANKD_OPTIONS.config_file)
 
     if "NSWorkspace" in CRANKD_CONFIG:
         add_workspace_notifications(CRANKD_CONFIG['NSWorkspace'])
@@ -444,8 +480,13 @@ def main():
     # We reuse our FSEvents code to watch for changes to our files and
     # restart if any of our libraries have been updated:
     add_conditional_restart(CRANKD_OPTIONS.config_file, "Configuration file %s changed" % CRANKD_OPTIONS.config_file)
-    for (m_name, m_file) in [(k, v) for k, v in sys.modules.iteritems() if hasattr(v, '__file__')]:
-        add_conditional_restart(m_file.__file__, "Module %s was updated" % m_name)
+    for m in filter(lambda m: m and hasattr(m, '__file__'), sys.modules.values()):
+        if m.__name__ == "__main__":
+            msg = "%s was updated" % m.__file__
+        else:
+            msg = "Module %s was updated" % m.__name__
+
+        add_conditional_restart(m.__file__, msg)
 
     signal.signal(signal.SIGHUP, partial(restart, "SIGHUP received"))
 
@@ -467,19 +508,37 @@ def main():
 
     sys.exit(0)
 
+def create_env_name(name):
+    """
+    Converts input names into more traditional shell environment name style
+
+    >>> create_env_name("NSApplicationBundleIdentifier")
+    'NSAPPLICATION_BUNDLE_IDENTIFIER'
+    >>> create_env_name("NSApplicationBundleIdentifier-1234$foobar!")
+    'NSAPPLICATION_BUNDLE_IDENTIFIER_1234_FOOBAR'
+    """
+    new_name = re.sub(r'''(?<=[a-z])([A-Z])''', '_\\1', name)
+    new_name = re.sub(r'\W+', '_', new_name)
+    new_name = re.sub(r'_{2,}', '_', new_name)
+    return new_name.upper().strip("_")
 
 def do_shell(command, context=None, **kwargs):
     """Executes a shell command with logging"""
     logging.info("%s: executing %s" % (context, command))
 
-    child_env = {'context': context}
-    for k in kwargs:
-        if callable(kwargs[k]):
-            continue
-        elif hasattr(kwargs[k], 'keys') and callable(kwargs[k].keys):
-            child_env.update(kwargs[k])
-        else:
-            child_env[k] = str(kwargs[k])
+    child_env = {'CRANKD_CONTEXT': context}
+
+    # We'll pull a subset of the available information in for shell scripts.
+    # Anyone who needs more will probably want to write a Python handler
+    # instead so they can reuse things like our logger & config info and avoid
+    # ordeals like associative arrays in Bash
+    for k in [ 'info', 'key' ]:
+        if k in kwargs and kwargs[k]:
+            child_env['CRANKD_%s' % k.upper()] = str(kwargs[k])
+
+    if 'user_info' in kwargs:
+        for k, v in kwargs['user_info'].items():
+            child_env[create_env_name(k)] = str(v)
 
     try:
         rc = call(command, shell=True, env=child_env)
@@ -494,7 +553,8 @@ def do_shell(command, context=None, **kwargs):
 
 
 def add_conditional_restart(file_name, reason):
-    """FSEvents monitors directories, not files. This function uses stat to restart only if the file's mtime has changed"""
+    """FSEvents monitors directories, not files. This function uses stat to
+    restart only if the file's mtime has changed"""
     file_name = os.path.realpath(file_name)
     while not os.path.exists(file_name):
         file_name = os.path.dirname(file_name)
@@ -511,7 +571,7 @@ def add_conditional_restart(file_name, reason):
 
 
 def restart(reason, *args, **kwargs):
-    """Perform a fresh restart of the current process"""
+    """Perform a complete restart of the current process using exec()"""
     logging.info("Restarting: %s" % reason)
     os.execv(sys.argv[0], sys.argv)
 

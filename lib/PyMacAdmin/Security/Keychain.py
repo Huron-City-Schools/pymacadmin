@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 # encoding: utf-8
 """
-Wrapper for the core Keychain API:
+Wrapper for the core Keychain API
+
+Most of the internals are directly based on the native Keychain API. Apple's developer documentation is highly relevant:
 
 http://developer.apple.com/documentation/Security/Reference/keychainservices/Reference/reference.html#//apple_ref/doc/uid/TP30000898-CH1-SW1
-
-Created by Chris Adams on 2009-01-06.
 """
 
 import os
@@ -38,7 +38,7 @@ class Keychain(object):
 
     def find_generic_password(self, service_name="", account_name=""):
         """Pythonic wrapper for SecKeychainFindGenericPassword"""
-        item            = ctypes.c_void_p()
+        item_p          = ctypes.c_uint32()
         password_length = ctypes.c_uint32(0)
         password_data   = ctypes.c_char_p(256)
 
@@ -57,7 +57,7 @@ class Keychain(object):
             account_name,                       # Account name
             ctypes.byref(password_length),      # Will be filled with pw length
             ctypes.pointer(password_data),      # Will be filled with pw data
-            ctypes.pointer(item)
+            ctypes.byref(item_p)
         )
 
         if rc == -25300:
@@ -67,9 +67,43 @@ class Keychain(object):
 
         password = password_data.value[0:password_length.value]
 
-        Security.lib.SecKeychainItemFreeContent(None, password_data)
+        # itemRef: A reference to the keychain item from which you wish to
+        # retrieve data or attributes.
+        #
+        # info:  A pointer to a list of tags of attributes to retrieve.
+        #
+        # itemClass: A pointer to the item’s class. You should pass NULL if not
+        # required. See “Keychain Item Class Constants” for valid constants.
+        #
+        # attrList: On input, the list of attributes in this item to get; on
+        # output the attributes are filled in. You should call the function
+        # SecKeychainItemFreeAttributesAndData when you no longer need the
+        # attributes and data.
+        #
+        # length: On return, a pointer to the actual length of the data.
+        #
+        # outData: A pointer to a buffer containing the data in this item. Pass
+        # NULL if not required. You should call the function
+        # SecKeychainItemFreeAttributesAndData when you no longer need the
+        # attributes and data.
 
-        return GenericPassword(service_name=service_name, account_name=account_name, password=password, keychain_item=item)
+        info    = SecKeychainAttributeInfo()
+        attrs_p = SecKeychainAttributeList_p()
+
+        # Thank you Wil Shipley:
+        # http://www.wilshipley.com/blog/2006/10/pimp-my-code-part-12-frozen-in.html
+        info.count = 1
+        info.tag.contents = Security.kSecLabelItemAttr
+
+        Security.lib.SecKeychainItemCopyAttributesAndData(item_p, ctypes.pointer(info), None, ctypes.byref(attrs_p), None, None)
+        attrs = attrs_p.contents
+        assert(attrs.count == 1)
+
+        label = attrs.attr[0].data[:attrs.attr[0].length]
+
+        Security.lib.SecKeychainFreeAttributeInfo(attrs_p)
+
+        return GenericPassword(service_name=service_name, account_name=account_name, password=password, keychain_item=item_p, label=label)
 
     def find_internet_password(self, account_name="", password="", server_name="", security_domain="", path="", port=0, protocol_type=None, authentication_type=None):
         """Pythonic wrapper for SecKeychainFindInternetPassword"""
@@ -86,7 +120,7 @@ class Keychain(object):
         if not isinstance(port, int):
             port = int(port)
 
-        rc = Security.lib.SecKeychainFindInternetPassword (
+        rc = Security.lib.SecKeychainFindInternetPassword(
             self.keychain_handle,
             len(server_name),
             server_name,
@@ -165,10 +199,10 @@ class Keychain(object):
 class GenericPassword(object):
     """Generic keychain password used with SecKeychainAddGenericPassword and SecKeychainFindGenericPassword"""
     # TODO: Add support for access control and attributes
-    # TODO: Add item name support
 
     account_name  = None
     service_name  = None
+    label         = None
     password      = None
     keychain_item = None # An SecKeychainItemRef treated as an opaque object
 
@@ -213,7 +247,7 @@ class GenericPassword(object):
 
     def __repr__(self):
         props = []
-        for k in ['service_name', 'account_name']:
+        for k in ['service_name', 'account_name', 'label']:
             props.append("%s=%s" % (k, repr(getattr(self, k))))
 
         return "%s(%s)" % (self.__class__.__name__, ", ".join(props))
@@ -241,3 +275,59 @@ class InternetPassword(GenericPassword):
                 props.append("%s=%s" % (k, repr(getattr(self, k))))
 
         return "%s(%s)" % (self.__class__.__name__, ", ".join(props))
+
+class SecKeychainAttribute(ctypes.Structure):
+    """Contains keychain attributes
+
+    tag:    A 4-byte attribute tag.
+    length: The length of the buffer pointed to by data.
+    data:   A pointer to the attribute data.
+    """
+    _fields_ = [
+        ('tag',     ctypes.c_uint32),
+        ('length',  ctypes.c_uint32),
+        ('data',    ctypes.c_char_p)
+    ]
+
+class SecKeychainAttributeList(ctypes.Structure):
+    """Represents a list of keychain attributes
+
+    count:  An unsigned 32-bit integer that represents the number of keychain attributes in the array.
+    attr:   A pointer to the first keychain attribute in the array.
+    """
+
+    # TODO: Standard iterator support for SecKeychainAttributeList:
+    #
+    #   for offset in range(0, attrs.count):
+    #     print "[%d]: %s: %s" % (offset, attrs.attr[offset].tag, attrs.attr[offset].data[:attrs.attr[offset].length])
+    #
+    # becomes:
+    #
+    #   for tag, data in attrs:
+    #       …
+    #
+    #   attrs[tag] should also work
+    #
+
+    _fields_ = [
+        ('count',   ctypes.c_uint),
+        ('attr',    ctypes.POINTER(SecKeychainAttribute))
+    ]
+
+class SecKeychainAttributeInfo(ctypes.Structure):
+    """Represents a keychain attribute as a pair of tag and format values.
+
+    count:  The number of tag-format pairs in the respective arrays
+    tag:    A pointer to the first attribute tag in the array
+    format: A pointer to the first CSSM_DB_ATTRIBUTE_FORMAT in the array
+    """
+    # TODO: SecKeychainAttributeInfo should allow .append(tag, [data])
+    _fields_ = [
+        ('count',   ctypes.c_uint),
+        ('tag',     ctypes.POINTER(ctypes.c_uint)),
+        ('format',  ctypes.POINTER(ctypes.c_uint))
+    ]
+
+# The APIs expect pointers to SecKeychainAttributeInfo objects:
+SecKeychainAttributeInfo_p = ctypes.POINTER(SecKeychainAttributeInfo)
+SecKeychainAttributeList_p = ctypes.POINTER(SecKeychainAttributeList)
